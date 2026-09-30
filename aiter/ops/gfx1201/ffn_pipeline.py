@@ -4,7 +4,7 @@
 import torch
 import torch.distributed as dist
 import triton
-from .tp_reduce import FusedReducer
+from .tp_reduce import make_reducer
 from .gated_residual import _gated_residual
 
 from .ffn_up import fused_up_out
@@ -13,7 +13,7 @@ from . import fp8_gemm
 
 
 class BufferedFFN:
-    def __init__(self, rows, token_rows, device, group=None):
+    def __init__(self, rows, token_rows, device, group=None, reducer="fused"):
         if rows < 1 or token_rows < 1 or rows * 7168 >= 2**31:
             raise ValueError('Positive dimensions within int32 indexing required')
         self.rows = rows
@@ -25,7 +25,7 @@ class BufferedFFN:
         with torch.cuda.device(self.device):
             self.activation = torch.empty((self.width, 7168), device=self.device, dtype=torch.bfloat16)
             self.activation8 = None
-            self.reducer = FusedReducer((rows, 5376), group)
+            self.reducer = make_reducer(reducer, (rows, 5376), group, stage_rows=self.width)
             self.output = self.reducer.output
             self.communication = torch.cuda.Stream() if group is not None else None
             self.last = torch.cuda.Event()
