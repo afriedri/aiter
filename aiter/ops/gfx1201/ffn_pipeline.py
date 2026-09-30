@@ -9,6 +9,7 @@ from .gated_residual import _gated_residual
 
 from .ffn_up import fused_up_out
 from .ffn_down import down_out
+from . import fp8_gemm
 
 
 class BufferedFFN:
@@ -23,6 +24,7 @@ class BufferedFFN:
             raise ValueError('TP2 only')
         with torch.cuda.device(self.device):
             self.activation = torch.empty((self.width, 7168), device=self.device, dtype=torch.bfloat16)
+            self.activation8 = None
             self.reducer = FusedReducer((rows, 5376), group)
             self.output = self.reducer.output
             self.communication = torch.cuda.Stream() if group is not None else None
@@ -75,6 +77,42 @@ class BufferedFFN:
                 complete = torch.cuda.Event()
                 complete.record(self.communication)
                 compute.wait_event(complete)
+            self.last = torch.cuda.Event()
+            self.last.record(compute)
+        return self.output
+
+    def run8(self, inputs, input_scales, up_weights, up_scales, down_weights, down_scales, residual, gate, indices):
+        """FP8 W8A8 variant of ``run``: inputs are per-token E4M3 [S,5376] + FP32 scales; weights are
+        per-channel E4M3 ([14336,5376] paired, [5376,7168]). The SwiGLU activation is re-quantized per token."""
+        if inputs.shape != (self.rows, 5376) or inputs.dtype != fp8_gemm.FP8 or input_scales.shape != (self.rows,):
+            raise ValueError('Expected FP8 [S,5376] input with [S] scales')
+        if up_weights.shape != (14336, 5376) or down_weights.shape != (5376, 7168):
+            raise ValueError('Expected FP8 [14336,5376] and [5376,7168] weights')
+        if self.group is None:
+            raise ValueError('TP2 group required')
+        if self.activation8 is None:
+            self.activation8 = torch.empty((self.width, 7168), device=self.device, dtype=fp8_gemm.FP8)
+            self.activation_scales = torch.empty((self.width,), device=self.device, dtype=torch.float32)
+        with torch.cuda.device(self.device):
+            compute = torch.cuda.current_stream()
+            compute.wait_event(self.last)
+            for first in range(0, self.rows, self.width):
+                last = min(self.rows, first + self.width)
+                activation = self.activation[:last - first]
+                activation8 = self.activation8[:last - first]
+                activation_scales = self.activation_scales[:last - first]
+                target = self.reducer.input[first:last]
+                fp8_gemm.up8_swiglu_out(inputs[first:last], input_scales[first:last], up_weights, up_scales, activation)
+                fp8_gemm.quant_rows(activation, activation8, activation_scales)
+                fp8_gemm.mm8_out(activation8, activation_scales, down_weights, down_scales, target)
+                ready = torch.cuda.Event()
+                ready.record(compute)
+                with torch.cuda.stream(self.communication):
+                    self.communication.wait_event(ready)
+                    self.reducer.reduce(residual, gate, indices, first * 5376, (last - first) * 5376)
+            complete = torch.cuda.Event()
+            complete.record(self.communication)
+            compute.wait_event(complete)
             self.last = torch.cuda.Event()
             self.last.record(compute)
         return self.output

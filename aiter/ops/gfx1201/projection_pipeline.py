@@ -8,6 +8,7 @@ from .tp_reduce import FusedReducer
 from .gated_residual import _gated_residual
 
 from .out_projection import project_out
+from . import fp8_gemm
 
 
 class BufferedProjection:
@@ -71,6 +72,31 @@ class BufferedProjection:
                 complete = torch.cuda.Event()
                 complete.record(self.communication)
                 compute.wait_event(complete)
+            self.last = torch.cuda.Event()
+            self.last.record(compute)
+        return self.output
+
+    def run8(self, inputs, input_scales, weights, weight_scales, residual, gate, indices):
+        """FP8 W8A8 variant of ``run``: inputs per-token E4M3 [S,3584] + scales, weights per-channel E4M3 [5376,3584]."""
+        if inputs.shape != (self.rows, 3584) or inputs.dtype != fp8_gemm.FP8 or weights.shape != (5376, 3584):
+            raise ValueError('Expected FP8 [S,3584] input and [5376,3584] weight')
+        if self.group is None:
+            raise ValueError('TP2 group required')
+        with torch.cuda.device(self.device):
+            compute = torch.cuda.current_stream()
+            compute.wait_event(self.last)
+            for first in range(0, self.rows, self.width):
+                last = min(self.rows, first + self.width)
+                target = self.reducer.input[first:last]
+                fp8_gemm.mm8_out(inputs[first:last], input_scales[first:last], weights, weight_scales, target)
+                ready = torch.cuda.Event()
+                ready.record(compute)
+                with torch.cuda.stream(self.communication):
+                    self.communication.wait_event(ready)
+                    self.reducer.reduce(residual, gate, indices, first * 5376, (last - first) * 5376)
+            complete = torch.cuda.Event()
+            complete.record(self.communication)
+            compute.wait_event(complete)
             self.last = torch.cuda.Event()
             self.last.record(compute)
         return self.output
