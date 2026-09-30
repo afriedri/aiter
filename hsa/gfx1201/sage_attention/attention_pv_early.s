@@ -625,6 +625,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	v_mov_b32_e32 v8, v204
 	s_mov_b32 s6, 0
 	s_mov_b32 s7, 0
+	s_mov_b32 s36, 0x76543210
 	v_dual_mov_b32 v244, 0x4b400000 :: v_dual_mov_b32 v245, 0x4b400000
 	v_dual_mov_b32 v246, 0x4b400000 :: v_dual_mov_b32 v247, 0x4b400000
 	v_dual_mov_b32 v248, 0x4b400000 :: v_dual_mov_b32 v249, 0x4b400000
@@ -761,6 +762,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 .LBB0_39:                               ;   in Loop: Header=BB0_37 Depth=1
 	s_wait_alu depctr_sa_sdst(0)
 	s_or_b32 exec_lo, exec_lo, s9
+	s_setprio 2
 	v_mad_co_u64_u32 v[209:210], null, 0x1100, s8, v[193:194]
 	v_add_nc_u32_e32 v196, 0x800, v209
 	ds_load_2addr_b64 v[231:234], v196 offset0:16 offset1:18
@@ -774,6 +776,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	s_lshl_b64 s[10:11], s[10:11], 2
 	s_wait_alu depctr_sa_sdst(0)
 	s_add_nc_u64 s[10:11], s[16:17], s[10:11]
+	s_load_b32 s10, s[10:11], 0x0
 	s_wait_dscnt 0x2
 	v_wmma_i32_16x16x16_iu8 v[223:230], v[231:232], v[169:170], v[244:251] neg_lo:[1,1,0]
 	v_wmma_i32_16x16x16_iu8 v[129:136], v[231:232], v[157:158], v[244:251] neg_lo:[1,1,0]
@@ -816,7 +819,6 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	v_wmma_i32_16x16x16_iu8 v[129:136], v[237:238], v[177:178], v[129:136] neg_lo:[1,1,0]
 	ds_load_2addr_b64 v[231:234], v209 offset0:12 offset1:14
 	ds_load_2addr_b64 v[235:238], v196 offset0:28 offset1:30
-	global_load_b32 v196, v204, s[10:11]
 	s_wait_dscnt 0x1
 	v_wmma_i32_16x16x16_iu8 v[215:222], v[231:232], v[181:182], v[215:222] neg_lo:[1,1,0]
 	s_wait_dscnt 0x0
@@ -859,15 +861,11 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	v_max3_num_f32 v209, v209, v229, v230
 	s_delay_alu instid0(VALU_DEP_2)
 	v_max3_num_f32 v239, v239, v135, v136
-	ds_bpermute_b32 v240, v207, v209
-	ds_bpermute_b32 v241, v207, v239
-	s_wait_loadcnt 0x0
-	v_mul_f32_e32 v196, v198, v196
-	v_max_num_f32_e32 v242, v214, v214
-	v_max_num_f32_e32 v243, v213, v213
+	v_permlanex16_b32 v240, v209, s36, 0xfedcba98
+	v_permlanex16_b32 v241, v239, s36, 0xfedcba98
+	s_wait_kmcnt 0x0
+	v_mul_f32_e32 v196, s10, v198
 	s_wait_dscnt 0x0
-	v_max_num_f32_e32 v240, v240, v240
-	v_max_num_f32_e32 v241, v241, v241
 	s_delay_alu instid0(VALU_DEP_2)
 	v_max_num_f32_e32 v209, v209, v240
 	s_delay_alu instid0(VALU_DEP_2)
@@ -920,9 +918,9 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	s_delay_alu instid0(VALU_DEP_2)
 	v_fma_f32 v239, v239, v196, -v254
 	s_delay_alu instid0(VALU_DEP_2)
-	v_max_num_f32_e32 v209, v242, v209
+	v_max_num_f32_e32 v209, v214, v209
 	s_delay_alu instid0(VALU_DEP_2)
-	v_max_num_f32_e32 v210, v243, v239
+	v_max_num_f32_e32 v210, v213, v239
 	s_delay_alu instid0(VALU_DEP_2)
 	v_fma_f32 v252, s34, v196, v209
 	s_delay_alu instid0(VALU_DEP_2)
@@ -1041,10 +1039,11 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 	s_delay_alu instid0(VALU_DEP_2)
 	v_add_f32_e32 v196, v144, v243
 	v_sub_f32_e32 v213, v213, v210
-	ds_bpermute_b32 v231, v207, v200
-	ds_bpermute_b32 v232, v207, v196
+	v_permlanex16_b32 v231, v200, s36, 0xfedcba98
+	v_permlanex16_b32 v232, v196, s36, 0xfedcba98
 	s_delay_alu instid0(VALU_DEP_1)
 	v_exp_f32_e32 v213, v213
+	s_setprio 0
 	v_cmpx_neq_f32_e32 1.0, v255
 	s_cbranch_execz .LBB0_41
 ; %bb.40:                               ;   in Loop: Header=BB0_37 Depth=1
@@ -2941,7 +2940,7 @@ sage_hip_attn_bm128_bn32:               ; @sage_hip_attn_bm128_bn32
 		.amdhsa_system_sgpr_workgroup_info 0
 		.amdhsa_system_vgpr_workitem_id 0
 		.amdhsa_next_free_vgpr 256
-		.amdhsa_next_free_sgpr 36
+		.amdhsa_next_free_sgpr 37
 		.amdhsa_reserve_vcc 1
 		.amdhsa_float_round_mode_32 0
 		.amdhsa_float_round_mode_16_64 0
@@ -3078,7 +3077,7 @@ amdhsa.kernels:
     .max_flat_workgroup_size: 512
     .name:           sage_hip_attn_bm128_bn32
     .private_segment_fixed_size: 0
-    .sgpr_count:     38
+    .sgpr_count:     39
     .sgpr_spill_count: 0
     .symbol:         sage_hip_attn_bm128_bn32.kd
     .uniform_work_group_size: 1
