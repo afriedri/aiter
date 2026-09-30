@@ -21,6 +21,7 @@ _VARIANTS = {
     "eb2satc": ("attention_pv_early_eb2satc.hsaco", 256),  # bm256, approximate exp-free FP8 P
     "eb2la": ("attention_pv_early_eb2la.hsaco", 256),      # eb2satc + lazy alpha (same approximation)
     "ec": ("attention_pv_early_ec.hsaco", 256),            # bm256 exp-free P with exact FP8 codes (LUT-corrected)
+    "esp321": ("attention_pv_early_esp321.hsaco", 256),    # eb2satc + per-phase wave priority (same approximation)
 }
 
 

@@ -1,6 +1,7 @@
 # Generator for the attention_pv_early variants (extends sage_pv_early_r9600d/tools/mk_e1.py).
 # MK_SRC=<original attention_pv_early.s at 19351a68> python3 mk_variants.py out.s <opts>
 #   b2x: addr canon lsum ldsa bm256 sa tmax la prio   ec: e1 addr canon n16 lsum ldsa bm256 sa tmax la ec   eb2la: e1 addr canon n16 lsum ldsa bm256 sa tmax la
+#   eb2satc: e1 addr canon n16 lsum ldsa bm256 sa tmax   esp321: e1 addr canon n16 lsum ldsa bm256 sa tmax sp321
 #!/usr/bin/env python3
 """Generate variants of CSE attention_pv_early.s.
 
@@ -590,5 +591,20 @@ for o in opts:
             out.insert(j, f"\ts_setprio {hi}")
         j = next(k for k, l in enumerate(out) if l.startswith("\tv_cmpx_neq_f32_e32") and l.endswith(", v255"))
         out.insert(j, f"\ts_setprio {lo}")
+
+for o in opts:
+    if o.startswith("sp") and o[2:].isdigit():
+        # exact: wave priority per phase. sp<X><Y>: s_setprio X after the last QK WMMA (softmax VALU phase),
+        # s_setprio Y at the top of the PV block (.LBB0_36; PV WMMA then QK WMMA of the next tile).
+        # sp<X><Y><Z>: also s_setprio Z just before the first QK WMMA of each tile.
+        # esp321 = eb2satc + sp321: softmax VALU of one wave overlaps the PV WMMA of the others (-0.8% vs eb2satc).
+        x, y = o[2], o[3]
+        a = out.index(".LBB0_36:                               ;   in Loop: Header=BB0_37 Depth=1")
+        b = out.index("\ts_cbranch_execz .LBB0_41")
+        qk = [i for i in range(a, b) if out[i].startswith("\tv_wmma_i32_16x16x16_iu8")]
+        out[qk[-1] + 1:qk[-1] + 1] = [f"\ts_setprio {x}"]
+        if len(o) > 4:
+            out[qk[0]:qk[0]] = [f"\ts_setprio {o[4]}"]
+        out[a + 1:a + 1] = [f"\ts_setprio {y}"]
 
 open(outp, "w").write("\n".join(out))
