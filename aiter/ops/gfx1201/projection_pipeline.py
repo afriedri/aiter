@@ -4,7 +4,7 @@
 import torch
 import torch.distributed as dist
 import triton
-from .tp_reduce import FusedReducer
+from .tp_reduce import make_reducer
 from .gated_residual import _gated_residual
 
 from .out_projection import project_out
@@ -12,7 +12,7 @@ from . import fp8_gemm
 
 
 class BufferedProjection:
-    def __init__(self, rows, token_rows, device, group=None):
+    def __init__(self, rows, token_rows, device, group=None, reducer="fused"):
         if rows < 1 or token_rows < 1 or rows * 7168 >= 2**31:
             raise ValueError('Positive dimensions within int32 indexing required')
         self.rows = rows
@@ -22,7 +22,7 @@ class BufferedProjection:
         if group is not None and dist.get_world_size(group) != 2:
             raise ValueError('TP2 only')
         with torch.cuda.device(self.device):
-            self.reducer = FusedReducer((rows, 5376), group)
+            self.reducer = make_reducer(reducer, (rows, 5376), group, stage_rows=self.width)
             self.output = self.reducer.output
             self.communication = torch.cuda.Stream() if group is not None else None
             self.last = torch.cuda.Event()
