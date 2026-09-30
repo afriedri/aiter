@@ -17,12 +17,44 @@ _modules = {}
 _VARIANTS = {
     "pv_early": ("attention_pv_early.hsaco", 512),
     "b1": ("attention_pv_early_b1.hsaco", 128),            # bm128, exact (fp32 row-sum reassociation only)
+    "b2x": ("attention_pv_early_b2x.hsaco", 256),          # bm256, exact exp (row-sum reassociation, lazy alpha)
     "eb2satc": ("attention_pv_early_eb2satc.hsaco", 256),  # bm256, approximate exp-free FP8 P
+    "eb2la": ("attention_pv_early_eb2la.hsaco", 256),      # eb2satc + lazy alpha (same approximation)
 }
-_VARIANT = os.environ.get("AITER_GFX1201_SAGE_ASM", "pv_early")
-if _VARIANT not in _VARIANTS:
-    raise ValueError(f"AITER_GFX1201_SAGE_ASM={_VARIANT!r}; expected one of {sorted(_VARIANTS)}")
+
+
+def _parse_schedule():
+    """AITER_GFX1201_SAGE_ASM_SCHED="b2x:250,eb2satc": the first 250 core launches (per process) use b2x,
+    the rest eb2satc. Segments are VARIANT[:COUNT]; the last one has no count. Without it, a single variant
+    comes from AITER_GFX1201_SAGE_ASM (default pv_early)."""
+    spec = os.environ.get("AITER_GFX1201_SAGE_ASM_SCHED", "").strip()
+    if not spec:
+        return [(os.environ.get("AITER_GFX1201_SAGE_ASM", "pv_early"), None)]
+    sched = []
+    for seg in spec.split(","):
+        name, _, count = seg.strip().partition(":")
+        sched.append((name, int(count) if count else None))
+    if any(c is None for _, c in sched[:-1]) or sched[-1][1] is not None:
+        raise ValueError(f"AITER_GFX1201_SAGE_ASM_SCHED={spec!r}: every segment but the last needs a :COUNT")
+    return sched
+
+
+_SCHEDULE = _parse_schedule()
+for _name, _ in _SCHEDULE:
+    if _name not in _VARIANTS:
+        raise ValueError(f"gfx1201 sage ASM variant {_name!r}; expected one of {sorted(_VARIANTS)}")
+_VARIANT = _SCHEDULE[0][0]
 _HSACO, _BLOCK = _VARIANTS[_VARIANT]
+_calls = 0
+
+
+def _current_variant():
+    left = _calls
+    for name, count in _SCHEDULE:
+        if count is None or left < count:
+            return name
+        left -= count
+    return _SCHEDULE[-1][0]
 
 
 def _check(status):
@@ -30,8 +62,10 @@ def _check(status):
         raise RuntimeError(f"HIP module API failed: {status}")
 
 
-def _function():
+def _function(variant=None):
     global _runtime
+    variant = variant or _VARIANT
+    hsaco = _VARIANTS[variant][0]
     if _runtime is None:
         _runtime = ctypes.CDLL("libamdhip64.so")
         _runtime.hipModuleLoad.argtypes = [
@@ -51,7 +85,7 @@ def _function():
             ctypes.POINTER(ctypes.c_void_p),
         ]
     code_object = os.path.join(
-        AITER_ASM_DIR, "gfx1201", "sage_attention", _HSACO
+        AITER_ASM_DIR, "gfx1201", "sage_attention", hsaco
     )
     key = (torch.cuda.current_device(), code_object)
     if key not in _modules:
@@ -65,7 +99,9 @@ def _function():
         )
         _modules[key] = (module, function)
         import sys
-        print(f"[aiter] gfx1201 sage ASM variant={_VARIANT} hsaco={_HSACO} block={_BLOCK}", file=sys.stderr, flush=True)
+        import time
+        print(f"[aiter] gfx1201 sage ASM variant={variant} hsaco={hsaco} block={_VARIANTS[variant][1]} "
+              f"from call {_calls} (schedule={_SCHEDULE}) t={time.time():.1f}", file=sys.stderr, flush=True)
     return _modules[key][1]
 
 
@@ -91,8 +127,12 @@ def launch_hip_sage_core(
         )
     if out.dtype != torch.bfloat16 or out.device != q_int8.device:
         raise ValueError("Expected BF16 output on the input device")
+    global _calls
+    variant = _current_variant()
+    block = _VARIANTS[variant][1]
+    _calls += 1
     with torch.cuda.device(q_int8.device):
-        function = _function()
+        function = _function(variant)
         arguments = [
             ctypes.c_void_p(tensor.data_ptr())
             for tensor in (q_int8, k_int8, v_fp8, q_scale, k_scale, v_scale, out)
@@ -104,14 +144,14 @@ def launch_hip_sage_core(
         parameters = (ctypes.c_void_p * len(arguments))(
             *[ctypes.addressof(argument) for argument in arguments]
         )
-        grid = batch_size * ((valid_seq_len + _BLOCK - 1) // _BLOCK) * num_heads
+        grid = batch_size * ((valid_seq_len + block - 1) // block) * num_heads
         _check(
             _runtime.hipModuleLaunchKernel(
                 function,
                 grid,
                 1,
                 1,
-                _BLOCK,
+                block,
                 1,
                 1,
                 0,
