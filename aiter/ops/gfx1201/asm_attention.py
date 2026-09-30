@@ -13,6 +13,17 @@ from aiter.jit.core import AITER_ASM_DIR
 _runtime = None
 _modules = {}
 
+# code object -> query rows (= threads) per workgroup. The launch block MUST match the hsaco.
+_VARIANTS = {
+    "pv_early": ("attention_pv_early.hsaco", 512),
+    "b1": ("attention_pv_early_b1.hsaco", 128),            # bm128, exact (fp32 row-sum reassociation only)
+    "eb2satc": ("attention_pv_early_eb2satc.hsaco", 256),  # bm256, approximate exp-free FP8 P
+}
+_VARIANT = os.environ.get("AITER_GFX1201_SAGE_ASM", "pv_early")
+if _VARIANT not in _VARIANTS:
+    raise ValueError(f"AITER_GFX1201_SAGE_ASM={_VARIANT!r}; expected one of {sorted(_VARIANTS)}")
+_HSACO, _BLOCK = _VARIANTS[_VARIANT]
+
 
 def _check(status):
     if status:
@@ -40,7 +51,7 @@ def _function():
             ctypes.POINTER(ctypes.c_void_p),
         ]
     code_object = os.path.join(
-        AITER_ASM_DIR, "gfx1201", "sage_attention", "attention_pv_early.hsaco"
+        AITER_ASM_DIR, "gfx1201", "sage_attention", _HSACO
     )
     key = (torch.cuda.current_device(), code_object)
     if key not in _modules:
@@ -53,6 +64,8 @@ def _function():
             )
         )
         _modules[key] = (module, function)
+        import sys
+        print(f"[aiter] gfx1201 sage ASM variant={_VARIANT} hsaco={_HSACO} block={_BLOCK}", file=sys.stderr, flush=True)
     return _modules[key][1]
 
 
@@ -91,14 +104,14 @@ def launch_hip_sage_core(
         parameters = (ctypes.c_void_p * len(arguments))(
             *[ctypes.addressof(argument) for argument in arguments]
         )
-        grid = batch_size * ((valid_seq_len + 511) // 512) * num_heads
+        grid = batch_size * ((valid_seq_len + _BLOCK - 1) // _BLOCK) * num_heads
         _check(
             _runtime.hipModuleLaunchKernel(
                 function,
                 grid,
                 1,
                 1,
-                512,
+                _BLOCK,
                 1,
                 1,
                 0,
