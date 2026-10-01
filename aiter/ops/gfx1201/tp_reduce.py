@@ -3,6 +3,7 @@
 
 import ctypes
 import math
+import os
 
 import torch
 import torch.distributed as dist
@@ -69,13 +70,14 @@ class FusedReducer:
 
 @triton.jit
 def _pull_combine(local, staged, output, residual, gate, indices, dimension: tl.constexpr, gate_stride: tl.constexpr,
-                  first, count, BLOCK: tl.constexpr):
+                  first, count, BLOCK: tl.constexpr, VOLATILE: tl.constexpr = False):
     # _gather_halves' math with the peer partial read from a local staging copy staged[0:count].
+    # VOLATILE: the stage was written by the peer's DMA engine (push), so read it past the caches.
     position = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     valid = position < count
     offsets = first + position
     local_value = tl.load(local + offsets, valid, other=0).to(tl.float32)
-    peer_value = tl.load(staged + position, valid, other=0).to(tl.float32)
+    peer_value = tl.load(staged + position, valid, other=0, volatile=VOLATILE).to(tl.float32)
     reduced = (local_value + peer_value).to(tl.bfloat16, fp_downcast_rounding='rtne').to(tl.float32)
     group = tl.load(indices + offsets // dimension, valid, other=0)
     scale = tl.load(gate + group * gate_stride + offsets % dimension, valid, other=0).to(tl.float32)
@@ -117,12 +119,69 @@ def _hip_check(status, what):
         raise RuntimeError(f"{what} failed: {status} {_hip_runtime().hipGetErrorString(status).decode()}")
 
 
-def _bf16_view(pointer, shape, device):
+def _bf16_view(pointer, shape, device, dtype=torch.bfloat16):
     numel = math.prod(shape)
-    storage = torch._C._construct_storage_from_data_pointer(pointer, device, numel * 2)
-    tensor = torch.empty(0, dtype=torch.bfloat16, device=device)
+    storage = torch._C._construct_storage_from_data_pointer(pointer, device, numel * dtype.itemsize)
+    tensor = torch.empty(0, dtype=dtype, device=device)
     tensor.set_(storage, 0, tuple(shape))
     return tensor
+
+
+@triton.jit(do_not_specialize=["value"])
+def _signal_peer(flag, value):
+    # System-scope release: the L2 write-back makes everything this GPU wrote before (in stream order) visible to
+    # the peer's DMA engine before the peer can observe the flag.
+    tl.atomic_xchg(flag, value, sem='release', scope='sys')
+
+
+_announced = False
+
+
+class _StreamBarrier:
+    """TP2 barrier without a spinning kernel: a 1-thread kernel stores an epoch into the peer's flag (system-scope
+    release), then hipStreamWaitValue32 makes the stream (command processor, no CU) wait until the own flag reaches
+    the epoch. Same ordering guarantees as the symmetric-memory barrier_kernel, but the waiting side occupies no
+    CU slot and issues no atomics while the peer is late (the c10d kernel slows a concurrent GEMM by ~5%)."""
+
+    def __init__(self, group, device):
+        runtime = _hip_runtime()
+        runtime.hipExtMallocWithFlags.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint]
+        runtime.hipMemset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+        runtime.hipStreamWaitValue32.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint,
+                                                 ctypes.c_uint32]
+        self.rank = dist.get_rank(group)
+        mine = ctypes.c_void_p()
+        _hip_check(runtime.hipExtMallocWithFlags(ctypes.byref(mine), 4096, 1), "hipExtMallocWithFlags")  # fine-grained
+        _hip_check(runtime.hipMemset(mine, 0, 4096), "hipMemset")
+        handle = _IpcHandle()
+        _hip_check(runtime.hipIpcGetMemHandle(ctypes.byref(handle), mine), "hipIpcGetMemHandle")
+        handles = [None, None]
+        dist.all_gather_object(handles, ctypes.string_at(ctypes.addressof(handle), 64), group=group)
+        peer = ctypes.c_void_p()
+        _hip_check(runtime.hipIpcOpenMemHandle(ctypes.byref(peer), _IpcHandle.from_buffer_copy(handles[1 - self.rank]),
+                                               1), "hipIpcOpenMemHandle")
+        self._pointers = (mine.value, peer.value)
+        self.peer_flag = _bf16_view(peer.value, (1,), device, torch.int32)
+        self.epoch = 0
+        global _announced
+        if not _announced:
+            _announced = True
+            print(f"[aiter] AITER_GFX1201_CP_BARRIER active (rank {self.rank})", flush=True)
+
+    def __call__(self):
+        self.epoch += 1
+        _signal_peer[(1,)](self.peer_flag, self.epoch, num_warps=1)
+        _hip_check(_hip_runtime().hipStreamWaitValue32(ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
+                                                       ctypes.c_void_p(self._pointers[0]), self.epoch, 0, 0xFFFFFFFF),
+                   "hipStreamWaitValue32")  # 0 = hipStreamWaitValueGte
+
+    def close(self):
+        if self._pointers is None:
+            return
+        mine, peer = self._pointers
+        self._pointers = None
+        _hip_check(_hip_runtime().hipIpcCloseMemHandle(ctypes.c_void_p(peer)), "hipIpcCloseMemHandle")
+        _hip_check(_hip_runtime().hipFree(ctypes.c_void_p(mine)), "hipFree")
 
 
 class PullReducer:
@@ -170,6 +229,33 @@ class PullReducer:
             self.output = torch.empty_like(self.input)
             rows = shape[0] if stage_rows is None else max(1, min(shape[0], stage_rows))
             self.stage = torch.empty(rows * math.prod(shape[1:]), device=device, dtype=torch.bfloat16)
+            self.barrier = lambda: self.input_handle.barrier(timeout_ms=30000)
+            self.stream_barrier = None
+            if os.environ.get("AITER_GFX1201_CP_BARRIER", "0") not in ("", "0"):
+                self.stream_barrier = _StreamBarrier(group, device)
+                self.barrier = self.stream_barrier
+            self.push = os.environ.get("AITER_GFX1201_PUSH_REDUCE", "0") not in ("", "0")
+            self._stage_pointers = None
+            if self.push:
+                # Two IPC-shared stage slots per rank; the peer's DMA engine writes its partial into slot (call & 1).
+                # Slot reuse is safe: my push of call n+2 is stream-ordered after my barrier of call n+1, which the
+                # peer passes only after its combine of call n (push -> barrier -> combine on one stream per reducer).
+                slot = self.stage.numel()
+                del self.stage
+                stage_pointer = ctypes.c_void_p()
+                _hip_check(runtime.hipMalloc(ctypes.byref(stage_pointer), 2 * slot * 2), "hipMalloc")
+                _hip_check(runtime.hipIpcGetMemHandle(ctypes.byref(handle), stage_pointer), "hipIpcGetMemHandle")
+                dist.all_gather_object(handles, ctypes.string_at(ctypes.addressof(handle), 64), group=group)
+                peer_stage = ctypes.c_void_p()
+                _hip_check(runtime.hipIpcOpenMemHandle(ctypes.byref(peer_stage),
+                                                       _IpcHandle.from_buffer_copy(handles[1 - self.rank]), 1),
+                           "hipIpcOpenMemHandle")
+                self._stage_pointers = (stage_pointer.value, peer_stage.value)
+                mine_stage = _bf16_view(stage_pointer.value, (2, slot), device)
+                theirs = _bf16_view(peer_stage.value, (2, slot), device)
+                self.stage_slots = (mine_stage[0], mine_stage[1])
+                self.peer_slots = (theirs[0], theirs[1])
+                self.calls = 0
             torch.cuda.synchronize(device)
             dist.barrier(group=group)
 
@@ -178,16 +264,36 @@ class PullReducer:
             count = self.input.numel() - first
         if first < 0 or count < 1 or first + count > self.input.numel():
             raise ValueError('Invalid flat reduction range')
+        if self.push:
+            return self._push_reduce(residual, gate, indices, first, count)
         with torch.cuda.device(self.input.device):
             if self.stage.numel() < count:
                 self.stage = torch.empty(count, device=self.input.device, dtype=torch.bfloat16)
-            self.input_handle.barrier(timeout_ms=30000)
+            self.barrier()
             self.stage[:count].copy_(self.peer_input.view(-1)[first:first + count])
             _pull_combine[(triton.cdiv(count, 4096),)](self.input, self.stage, self.output, residual, gate, indices,
                                                        residual.shape[1], gate.stride(0), first, count, BLOCK=4096,
                                                        num_warps=8, enable_fp_fusion=False)
             if self.trailing_barrier:
-                self.input_handle.barrier(timeout_ms=30000)
+                self.barrier()
+        return self.output
+
+    def _push_reduce(self, residual, gate, indices, first, count):
+        """AITER_GFX1201_PUSH_REDUCE=1: DMA-push my partial into the peer's stage slot, barrier, combine with the
+        peer's partial from my own slot. Same combine math -> bitwise equal to the pull path. Push is ~15% faster
+        than pull over this PCIe topology and slows the overlapped GEMMs less (microbench: +2.5% vs +5%)."""
+        if count > self.stage_slots[0].numel():
+            raise ValueError('push reduce: chunk larger than the stage slot')
+        slot = self.calls & 1
+        self.calls += 1
+        with torch.cuda.device(self.input.device):
+            self.peer_slots[slot][:count].copy_(self.input.view(-1)[first:first + count])
+            self.barrier()
+            _pull_combine[(triton.cdiv(count, 4096),)](self.input, self.stage_slots[slot], self.output, residual, gate,
+                                                       indices, residual.shape[1], gate.stride(0), first, count,
+                                                       BLOCK=4096, VOLATILE=True, num_warps=8, enable_fp_fusion=False)
+            if self.trailing_barrier:
+                self.barrier()
         return self.output
 
     def close(self):
@@ -199,6 +305,13 @@ class PullReducer:
         self._pointers = None
         _hip_check(_hip_runtime().hipIpcCloseMemHandle(ctypes.c_void_p(peer)), "hipIpcCloseMemHandle")
         _hip_check(_hip_runtime().hipFree(ctypes.c_void_p(mine)), "hipFree")
+        if self.stream_barrier is not None:
+            self.stream_barrier.close()
+        if self._stage_pointers is not None:
+            mine, peer = self._stage_pointers
+            self._stage_pointers = None
+            _hip_check(_hip_runtime().hipIpcCloseMemHandle(ctypes.c_void_p(peer)), "hipIpcCloseMemHandle")
+            _hip_check(_hip_runtime().hipFree(ctypes.c_void_p(mine)), "hipFree")
 
 
 def make_reducer(kind, shape, group, stage_rows=None):

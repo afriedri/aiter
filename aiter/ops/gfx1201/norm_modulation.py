@@ -33,7 +33,8 @@ def _rms_modulate(inputs, weight, scale, shift, indices, output, eps, WIDTH: tl.
     tl.store(output + base + offsets, (product + shift_value).to(tl.bfloat16), valid)
 
 
-def rms_modulate(inputs, weight, eps, scale, shift, indices):
+def rms_modulate(inputs, weight, eps, scale, shift, indices, output=None):
+    """output: optional contiguous tensor like inputs to write (rows are independent, so row slices are exact)."""
     if inputs.ndim != 2 or min(inputs.shape) < 1 or not inputs.is_cuda or not inputs.is_contiguous():
         raise ValueError('Expected positive contiguous GPU [S,D] input')
     if weight.shape != (inputs.shape[1],) or not weight.is_contiguous():
@@ -50,7 +51,11 @@ def rms_modulate(inputs, weight, eps, scale, shift, indices):
         raise ValueError('Expected contiguous per-token int32/int64 indices on the same GPU')
     if inputs.shape[1] > 8192:
         raise ValueError('Row width above 8192 unsupported')
-    output = torch.empty_like(inputs)
+    if output is None:
+        output = torch.empty_like(inputs)
+    elif output.shape != inputs.shape or output.dtype != inputs.dtype or not output.is_contiguous() \
+            or output.device != inputs.device:
+        raise ValueError('output must be a contiguous tensor like inputs')
     with torch.cuda.device(inputs.device):
         _rms_modulate[(inputs.shape[0],)](
             inputs, weight, scale, shift, indices, output, float(eps), WIDTH=inputs.shape[1],

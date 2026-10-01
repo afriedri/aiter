@@ -46,8 +46,10 @@ def _qkv(inputs, wq, wk, wv, oq, ok, ov, rows,
              accumulator.to(tl.bfloat16), row[:, None] < rows)
 
 
-def qkv_projection(inputs, query_weight, key_weight, value_weight):
-    """inputs [S,5376]; weights [3584,5376] contiguous (TP2 local heads). Returns (query, key, value) [S,3584]."""
+def qkv_projection(inputs, query_weight, key_weight, value_weight, outputs=None):
+    """inputs [S,5376]; weights [3584,5376] contiguous (TP2 local heads). Returns (query, key, value) [S,3584].
+    outputs: optional three contiguous BF16 [S,3584] tensors to write (e.g. row slices of larger buffers; each output
+    row depends only on its input row, so row-split launches are bitwise equal to one launch)."""
     if inputs.ndim != 2 or inputs.shape[0] < 1 or inputs.shape[1] != 5376:
         raise ValueError('Expected positive [S,5376] input')
     weights = (query_weight, key_weight, value_weight)
@@ -59,7 +61,11 @@ def qkv_projection(inputs, query_weight, key_weight, value_weight):
     if max(inputs.numel(), inputs.shape[0] * 3584) >= 2**31:
         raise ValueError('32-bit index limit exceeded')
     rows = inputs.shape[0]
-    outputs = [torch.empty((rows, 3584), device=inputs.device, dtype=torch.bfloat16) for _ in range(3)]
+    if outputs is None:
+        outputs = [torch.empty((rows, 3584), device=inputs.device, dtype=torch.bfloat16) for _ in range(3)]
+    elif len(outputs) != 3 or any(o.shape != (rows, 3584) or o.dtype != torch.bfloat16 or not o.is_contiguous()
+                                  or o.device != inputs.device for o in outputs):
+        raise ValueError('Expected three contiguous BF16 [S,3584] outputs')
     with torch.cuda.device(inputs.device):
         _qkv[(triton.cdiv(rows, 128) * 3 * (3584 // 256),)](
             inputs, *weights, *outputs, rows, BM=128, BN=256, BK=64, GROUP=32, num_warps=8, num_stages=2)
