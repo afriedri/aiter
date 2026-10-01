@@ -38,8 +38,17 @@ class H3TP2Workspace:
     def tail_chunks(self, chunk=8192):
         return [(first, min(self.rows, first + chunk)) for first in range(0, self.rows, chunk)]
 
+    pending = None
+
+    def take_pending(self):
+        """(event, first_row) of a deferred final FFN reduce (fused_tail(defer=True)), or None. The caller must make
+        its stream wait on the event before reading block-output rows >= first_row; it may read rows < first_row
+        immediately."""
+        pending, self.pending = self.pending, None
+        return pending
+
     def fused_tail(self, attention, residual, out_weights, up_weights, down_weights, gate_msa, gate_mlp, indices,
-                   norm_modulation, chunk=8192):
+                   norm_modulation, chunk=8192, defer=False):
         """Out-projection + reduce + gated residual, then norm2/modulation + FFN + reduce + gated residual, row-chunked
         so that FFN chunk i waits only for the reduce of the out-projection rows it consumes (the out-projection
         communication hides behind FFN compute). Same kernels and reduction math as
@@ -48,7 +57,11 @@ class H3TP2Workspace:
         attention [S,3584]; residual [S,5376] (block input); out_weights [3584,5376] stride (1,3584);
         up_weights [14336,5376] contiguous (paired SwiGLU halves); down_weights [7168,5376] stride (1,7168);
         norm_modulation(x_rows, indices_rows) -> modulated BF16 rows (must be row-local, e.g. the fused
-        rms_modulate). Returns the block output [S,5376] (a workspace buffer, valid until the next call)."""
+        rms_modulate). Returns the block output [S,5376] (a workspace buffer, valid until the next call).
+
+        defer=True: the compute stream does not wait for the last chunk's FFN reduce; rows of the last chunk become
+        valid only after the event returned by take_pending() (all other rows are valid in compute-stream order).
+        Lets the next block start norm/QKV on the leading rows while the last reduce is still in flight."""
         projection, ffn = self.projection, self.ffn
         rows = residual.shape[0]
         if rows != self.rows or attention.shape != (rows, 3584) or residual.shape != (rows, _WIDTH):
@@ -66,6 +79,10 @@ class H3TP2Workspace:
         if not attention.is_contiguous() or not residual.is_contiguous():
             raise ValueError('Contiguous attention and residual required')
         bounds = self.tail_chunks(chunk)
+        if self.pending is not None:
+            raise RuntimeError('fused_tail: previous deferred reduce was not consumed (take_pending)')
+        defer = defer and len(bounds) > 1
+        reduced = []
         with torch.cuda.device(self.device):
             compute = torch.cuda.current_stream()
             compute.wait_event(projection.last)
@@ -94,6 +111,20 @@ class H3TP2Workspace:
                 with torch.cuda.stream(ffn.communication):
                     ffn.communication.wait_event(ready)
                     ffn.reducer.reduce(middle, gate_mlp, indices, first * _WIDTH, (last - first) * _WIDTH)
+                    if defer:
+                        done = torch.cuda.Event()
+                        done.record(ffn.communication)
+                        reduced.append(done)
+            if defer:
+                complete = torch.cuda.Event()
+                complete.record(projection.communication)
+                compute.wait_event(complete)
+                compute.wait_event(reduced[-2])
+                projection.last = torch.cuda.Event()
+                projection.last.record(compute)
+                ffn.last = reduced[-1]
+                self.pending = (reduced[-1], bounds[-1][0])
+                return ffn.output
             for stream in (projection.communication, ffn.communication):
                 complete = torch.cuda.Event()
                 complete.record(stream)
