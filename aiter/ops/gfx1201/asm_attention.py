@@ -23,6 +23,7 @@ _VARIANTS = {
     "ec": ("attention_pv_early_ec.hsaco", 256),            # bm256 exp-free P with exact FP8 codes (LUT-corrected)
     "esp321": ("attention_pv_early_esp321.hsaco", 256),    # eb2satc + per-phase wave priority (same approximation)
     "esp321x": ("attention_pv_early_esp321x.hsaco", 256),  # esp321, bitwise identical: permlanex16 row max, s_load k-scale, exact lazy alpha, 64K LDS
+    "esp321y": ("attention_pv_early_esp321y.hsaco", 256),  # esp321x, bitwise identical: PV-phase wave priority 3, softmax 2 -> 3 at the P pack
 }
 
 
