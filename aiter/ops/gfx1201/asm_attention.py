@@ -25,6 +25,7 @@ _VARIANTS = {
     "esp321x": ("attention_pv_early_esp321x.hsaco", 256),  # esp321, bitwise identical: permlanex16 row max, s_load k-scale, exact lazy alpha, 64K LDS
     "esp321y": ("attention_pv_early_esp321y.hsaco", 256),  # esp321x, bitwise identical: PV-phase wave priority 3, softmax 2 -> 3 at the P pack
     "esp321z": ("attention_pv_early_esp321z.hsaco", 256),  # esp321y, ~2.6% faster (not bitwise): scalar softmax scale, l accumulated in place, single uniform rescale branch
+    "esp321w": ("attention_pv_early_esp321w.hsaco", 256),  # esp321z, ~3% faster (not bitwise; bitwise = mg): 240 VGPRs (3 WG/WGP), loop unrolled x2 with static LDS parity, SALU pointers, 4-chain QK WMMA schedule
 }
 
 
