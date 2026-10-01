@@ -49,6 +49,10 @@ def down_out(inputs, weights, output):
     if max(inputs.numel(), output.numel()) >= 2**31:
         raise ValueError('32-bit index limit exceeded')
     with torch.cuda.device(inputs.device):
+        if os.environ.get("AITER_GFX1201_DOWN_BLAS", "0") not in ("", "0"):
+            # hipBLASLt: ~4.5% faster at 8192 rows under the 150 W cap; NOT bitwise (0.08% of outputs differ by
+            # 1 BF16 ulp, same relative error vs an FP32 reference as the Triton kernel)
+            return torch.mm(inputs, weights, out=output)
         if os.environ.get("AITER_GFX1201_TAIL_TUNED", "0") not in ("", "0"):
             # 256x128 tiles, GROUP 8: ~2% faster at 8192 rows under the 150 W cap; same K order -> bitwise equal
             return _down[(triton.cdiv(inputs.shape[0], 256) * 42,)](
