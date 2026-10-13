@@ -32,6 +32,9 @@ _VARIANTS = {
     "esp321sk3": ("attention_pv_early_esp321sk3.hsaco", 256),  # esp321 + exact zero-P PV skip (16x16 blocks), bitwise == esp321
     "esp321skt2": ("attention_pv_early_esp321skt2.hsaco", 256),  # APPROX: esp321sk3, threshold 2^-2 (op rel_l2 ~2.5e-3)
     "esp321skt4": ("attention_pv_early_esp321skt4.hsaco", 256),  # APPROX: esp321sk3, threshold 2^-4 (op rel_l2 ~7e-4)
+    "esp321kpsk3tb": ("attention_pv_early_esp321kpsk3tb.hsaco", 256),  # esp321sk3 + K-load pipelined QK + triple-buffered LDS (barrier signal moved to QK); bitwise == esp321
+    "esp321kpskt2tb": ("attention_pv_early_esp321kpskt2tb.hsaco", 256),  # APPROX: esp321skt2 + kp + tb (bitwise == esp321skt2)
+    "esp321kpskt4tb": ("attention_pv_early_esp321kpskt4tb.hsaco", 256),  # APPROX: esp321skt4 + kp + tb (bitwise == esp321skt4)
 }
 
 
