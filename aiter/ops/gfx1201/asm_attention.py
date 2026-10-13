@@ -29,6 +29,9 @@ _VARIANTS = {
     "esp321wsk7": ("attention_pv_early_esp321wsk7.hsaco", 256),  # esp321w + exact zero-P PV skip (inline guarded PV groups, in-group row sums); bitwise == esp321w
     "esp321wsk7t2": ("attention_pv_early_esp321wsk7t2.hsaco", 256),  # APPROX: esp321wsk7, drop 16x16 P blocks whose per-lane 8-key P sums are all < 2^-2
     "esp321wsk7m5": ("attention_pv_early_esp321wsk7m5.hsaco", 256),  # APPROX: esp321wsk7, drop 16x16 P blocks whose FP8 codes are all < 2^-5
+    "esp321sk3": ("attention_pv_early_esp321sk3.hsaco", 256),  # esp321 + exact zero-P PV skip (16x16 blocks), bitwise == esp321
+    "esp321skt2": ("attention_pv_early_esp321skt2.hsaco", 256),  # APPROX: esp321sk3, threshold 2^-2 (op rel_l2 ~2.5e-3)
+    "esp321skt4": ("attention_pv_early_esp321skt4.hsaco", 256),  # APPROX: esp321sk3, threshold 2^-4 (op rel_l2 ~7e-4)
 }
 
 
